@@ -215,7 +215,50 @@ enum Crypto {
         if contentKey.count > 32 { contentKey = contentKey.suffix(32) }  // firmware anomaly fallback
         guard contentKey.count == 32 else { throw CryptoError.message("content key wrong length") }
         let body = data.subdata(in: headerSize..<data.count)
-        return chacha20(body, key: contentKey, nonce: nonce, counter: counter)
+        return try decryptBody(body, key: contentKey, nonce: nonce, counter: counter, segmentSize: Int(u32(144)))
+    }
+
+    // Two body layouts, chosen by the header's segment size (u32 at 144):
+    // - 0 (the Note Pro): one ChaCha20 stream from the header's counter, and the result is Ogg.
+    // - above 0 (the original Note: 80): each segment is encrypted on its own, with the block
+    //   counter back at 0 (the official app's yl7.a passes 0 for every segment). The result is
+    //   bare Opus frames, one per segment, which are wrapped in Ogg here.
+    // Reported with a patch by bitboxx in roopen219/plaude-archiver#1.
+    static func decryptBody(_ body: Data, key: Data, nonce: Data, counter: UInt32, segmentSize: Int) throws -> Data {
+        guard segmentSize > 0 else { return chacha20(body, key: key, nonce: nonce, counter: counter) }
+        guard segmentSize <= 4096 else { throw CryptoError.message("segment size \(segmentSize) not supported") }
+        var clear = Data(capacity: body.count)
+        var off = body.startIndex
+        while off < body.endIndex {
+            let end = min(off + segmentSize, body.endIndex)
+            clear.append(chacha20(body.subdata(in: off..<end), key: key, nonce: nonce, counter: 0))
+            off = end
+        }
+        if clear.prefix(4) == Data("OggS".utf8) { return clear }
+        // The Ogg pages below are built here, so their CRCs prove nothing about the decrypt.
+        // Check the frames themselves first, by the official app's rule.
+        guard opusFramesLookValid(clear, frameBytes: segmentSize) else {
+            throw CryptoError.message("the decrypted audio is not Opus frames; the key or the segment layout is wrong")
+        }
+        return OggOpus.wrap(clear, frameBytes: segmentSize)
+    }
+
+    // The official app's check for bare-frame recordings (fem.a.o): skip all-zero frames; every
+    // other frame starts with Opus TOC byte 0xB8 or 0xB9 (CELT wideband, 20 ms, mono). It allows
+    // fewer than 5 frames that do not.
+    static func opusFramesLookValid(_ data: Data, frameBytes: Int) -> Bool {
+        let d = [UInt8](data)
+        guard frameBytes > 0, d.count >= frameBytes else { return false }
+        var nonZero = 0, valid = 0
+        var i = 0
+        while i + frameBytes <= d.count {
+            if d[i..<(i + frameBytes)].contains(where: { $0 != 0 }) {
+                nonZero += 1
+                if d[i] == 0xB8 || d[i] == 0xB9 { valid += 1 }
+            }
+            i += frameBytes
+        }
+        return nonZero > 0 && nonZero - valid < 5
     }
 
     // MARK: Ogg integrity
@@ -253,5 +296,55 @@ enum Crypto {
         var c = UInt32(n) << 24
         for _ in 0..<8 { c = c & 0x8000_0000 != 0 ? (c << 1) ^ 0x04C1_1DB7 : c << 1 }
         return c
+    }
+}
+
+// Wraps the original Note's bare Opus frames (CELT wideband, 20 ms, mono, one frame per segment)
+// in an Ogg Opus stream, one frame per packet and 50 frames per page.
+// From bitboxx's patch in roopen219/plaude-archiver#1; checked there against an independent decoder.
+enum OggOpus {
+    private static let crcTable: [UInt32] = (0..<256).map { i -> UInt32 in
+        var r = UInt32(i) << 24
+        for _ in 0..<8 { r = (r & 0x8000_0000) != 0 ? (r << 1) ^ 0x04C1_1DB7 : r << 1 }
+        return r
+    }
+
+    private static func le<T: FixedWidthInteger>(_ v: T) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+
+    private static func page(_ serial: UInt32, _ seq: UInt32, _ granule: UInt64, _ packets: [Data], _ type: UInt8) -> Data {
+        var lacing = [UInt8]()
+        for p in packets { lacing += Array(repeating: 255, count: p.count / 255); lacing.append(UInt8(p.count % 255)) }
+        var out = Data("OggS".utf8)
+        out.append(contentsOf: [0, type])
+        out.append(le(granule)); out.append(le(serial)); out.append(le(seq))
+        out.append(contentsOf: [0, 0, 0, 0, UInt8(lacing.count)])
+        out.append(contentsOf: lacing)
+        for p in packets { out.append(p) }
+        var crc: UInt32 = 0
+        for b in out { crc = (crc << 8) ^ crcTable[Int(((crc >> 24) ^ UInt32(b)) & 0xFF)] }
+        out.replaceSubrange(22..<26, with: le(crc))
+        return out
+    }
+
+    static func wrap(_ raw: Data, frameBytes: Int = 80, inputRate: UInt32 = 16000) -> Data {
+        let bytes = [UInt8](raw)
+        let frames = stride(from: 0, to: bytes.count - frameBytes + 1, by: frameBytes).map { Data(bytes[$0..<($0 + frameBytes)]) }
+        let serial: UInt32 = 0x504C_4144
+        var head = Data("OpusHead".utf8)
+        head.append(contentsOf: [1, 1])                       // version 1, one channel
+        head.append(le(UInt16(312))); head.append(le(inputRate))
+        head.append(contentsOf: [0, 0, 0])                    // output gain, mapping family 0
+        var tags = Data("OpusTags".utf8)
+        tags.append(le(UInt32(6))); tags.append(Data("plaude".utf8)); tags.append(le(UInt32(0)))
+        var out = page(serial, 0, 0, [head], 0x02)
+        out.append(page(serial, 1, 0, [tags], 0x00))
+        var seq: UInt32 = 2, granule: UInt64 = 0, i = 0
+        while i < frames.count {
+            let chunk = Array(frames[i..<min(i + 50, frames.count)])
+            granule += 960 * UInt64(chunk.count)              // 20 ms at 48 kHz per frame
+            out.append(page(serial, seq, granule, chunk, i + 50 >= frames.count ? 0x04 : 0x00))
+            seq += 1; i += 50
+        }
+        return out
     }
 }

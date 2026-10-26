@@ -316,10 +316,15 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         let serial = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data)
             .flatMap { BLEManager.serial(fromManufacturerData: $0) }
         var c = candidates[p.identifier] ?? Candidate(peripheral: p, name: nil, serial: nil, rssi: RSSI.intValue)
+        // Log a device when first seen, and again when its serial first shows, with the raw
+        // manufacturer data: it is what the serial is parsed from.
+        if candidates[p.identifier] == nil || (c.serial == nil && serial != nil) {
+            let mfr = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data).map { $0.map { String(format: "%02x", $0) }.joined() }
+            trace("candidate \(p.identifier) \(name ?? "?") serial \(serial ?? "-") rssi \(RSSI) mfr \(mfr ?? "-")")
+        }
         c.name = name ?? c.name
         c.serial = serial ?? c.serial
         c.rssi = RSSI.intValue
-        if candidates[p.identifier] == nil { trace("candidate \(p.identifier) \(name ?? "?") serial \(serial ?? "-") rssi \(RSSI)") }
         candidates[p.identifier] = c
         consider(c)
     }
@@ -733,11 +738,29 @@ final class BLEManager: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         }
     }
 
-    // The serial is 8 bytes inside the manufacturer data; its uppercase hex is the serial
-    // string and starts with the 3-digit model code (881 = Note Pro, 888 Note, 880/882 Pin, 860 One).
+    // The serial's uppercase hex is the serial string and starts with the 3-digit model code
+    // (881 = Note Pro, 888 Note, 880/882 Pin, 860 One). The manufacturer data is
+    // [company u16][n][project, n bytes][L][version, L bytes][S][serial, S bytes]; the original
+    // Note's serial is 9 bytes (roopen219/plaude-archiver#1, from bitboxx). Read the declared
+    // length first; if the data does not have that shape, fall back to the older scan for an
+    // 8-byte serial, which is what found the Note Pro's serial so far.
     static func serial(fromManufacturerData data: Data) -> String? {
-        let hex = data.map { String(format: "%02X", $0) }.joined()
         let models = ["881", "888", "880", "882", "860"]
+        let b = [UInt8](data)
+        if b.count > 4 {
+            let vAt = 3 + Int(b[2])
+            if vAt < b.count {
+                let sAt = vAt + 1 + Int(b[vAt])
+                if sAt < b.count {
+                    let sl = Int(b[sAt])
+                    if sl >= 8, sl <= 10, sAt + 1 + sl <= b.count {
+                        let s = b[(sAt + 1)..<(sAt + 1 + sl)].map { String(format: "%02X", $0) }.joined()
+                        if models.contains(where: { s.hasPrefix($0) }) { return s }
+                    }
+                }
+            }
+        }
+        let hex = data.map { String(format: "%02X", $0) }.joined()
         var i = hex.startIndex
         while let end = hex.index(i, offsetBy: 16, limitedBy: hex.endIndex) {
             let window = String(hex[i..<end])

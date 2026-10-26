@@ -411,6 +411,29 @@ final class DeviceModel: ObservableObject {
         return out.joined(separator: "\n")
     }
 
+    // Headless, offline regression check (for --check-decrypt <folder>): decrypt every
+    // plaud_<id>.plaud in the folder with this account's stored key, and compare the result with
+    // the .ogg next to it, made by an earlier build. No Bluetooth, no network.
+    func checkDecrypt(folder: URL) throws -> String {
+        guard let pem = store.devicePrivatePEM else { throw BLEError.message("no stored key: sign in and connect once first") }
+        let key = try Crypto.importRSAPrivateKey(pem: Data(pem.utf8))
+        let files = try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "plaud" }.sorted { $0.path < $1.path }
+        var out: [String] = []
+        for f in files {
+            let raw = try Data(contentsOf: f)
+            let segment = raw.count >= 148 ? Int(raw[144]) | Int(raw[145]) << 8 | Int(raw[146]) << 16 | Int(raw[147]) << 24 : -1
+            let line = "\(f.lastPathComponent) segment \(segment): "
+            do {
+                let clear = try Crypto.decryptRecordingFile(raw, privateKey: key)
+                let earlier = try? Data(contentsOf: f.deletingPathExtension().appendingPathExtension("ogg"))
+                out.append(line + "\(clear.count) B, whole Ogg \(Crypto.isCompleteOgg(clear)), "
+                           + (earlier.map { $0 == clear ? "identical to the earlier .ogg" : "DIFFERS from the earlier .ogg" } ?? "no earlier .ogg"))
+            } catch { out.append(line + "failed: \(error)") }
+        }
+        return out.joined(separator: "\n")
+    }
+
     // Headless check of recording control (for --test-recording). It makes a short recording on
     // the device: start, pause, resume, stop, and prints the device events it saw.
     func testRecording() async throws -> String {

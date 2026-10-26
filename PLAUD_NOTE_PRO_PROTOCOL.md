@@ -108,12 +108,12 @@ The bytes the device sends are not Ogg. They are a `PLAUD.AI` file (`fem.a.h`, `
 | 58 | file UUID, 16 bytes |
 | 128 | ChaCha20 start counter u32 |
 | 132 | ChaCha20 nonce, 12 bytes |
-| 144 | segment size u32 (0 on my file) |
+| 144 | segment size u32 (0 on every Note Pro file seen; 80 on the original Note, see step 2) |
 | 256 | key cipher, 256 bytes |
 
 To decrypt version 1:
 1. RSA-decrypt the key cipher (PKCS#1 v1.5) with the user private key from `gen_key`. This gives the 32-byte content key. The app uses the last 32 bytes if the result is longer.
-2. Decrypt everything after the header with plain ChaCha20 (RFC 8439, no Poly1305), using the counter and nonce from the header.
+2. Decrypt everything after the header with plain ChaCha20 (RFC 8439, no Poly1305), using the counter and nonce from the header. If the segment size is above 0, each segment of that many bytes is encrypted on its own, with the block counter at 0 for every segment (the official app's `yl7.a`). On the original Note (segment size 80) the result is bare Opus frames, one per segment, each starting with TOC byte `0xB8` or `0xB9` (CELT wideband, 20 ms, mono), with no Ogg pages; the app wraps them in Ogg. Reported by bitboxx in [issue #1](https://github.com/roopen219/plaude-archiver/issues/1).
 
 The result is a normal Ogg Opus file. My 7.9 s test recording decoded with ffmpeg: Opus, mono, mean volume -17.6 dB.
 

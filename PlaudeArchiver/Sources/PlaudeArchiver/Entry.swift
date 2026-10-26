@@ -18,6 +18,15 @@ struct PlaudApp {
             } catch { FileHandle.standardError.write(Data("selftest error: \(error)\n".utf8)); exit(1) }
         }
 
+        // Hidden offline check: decrypt the .plaud files in a folder and compare with their .ogg.
+        if args.count == 3, args[1] == "--check-decrypt" {
+            do {
+                let report = try DeviceModel().checkDecrypt(folder: URL(fileURLWithPath: args[2]))
+                FileHandle.standardOutput.write(Data((report + "\n").utf8))
+                exit(0)
+            } catch { FileHandle.standardError.write(Data("check error: \(error)\n".utf8)); exit(1) }
+        }
+
         // Hidden headless device checks. --probe-device and --probe-settings only read;
         // --probe-features changes settings and restores them; --test-recording makes a short recording;
         // --selftest downloads and then deletes one recording.
