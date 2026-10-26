@@ -84,7 +84,7 @@ Power/UI: `setAutoPowerOff`, `setBackLightBrightness`, `setBackLightTime`, `setL
 
 ---
 
-## For plaude-pirate: the "free up space" feature
+## For Plaude Archiver: the "free up space" feature
 
 Everything needed is already in our protocol layer. After a recording is **downloaded, decrypted and verified** (`data.count == size`, header check passes), send:
 
