@@ -72,7 +72,8 @@ enum Proto {
 
     // [cmd u16][total u8][index u8][<=100 bytes] used for FE10/FE12 chunks.
     static func feChunk(_ cmd: UInt16, total: Int, index: Int, _ slice: Data) -> Data {
-        Data(u16le(cmd) + [UInt8(total), UInt8(index)] + slice)
+        // [UInt8] + Data does not compile on Swift 6.2 (#1); join as Data.
+        Data(u16le(cmd) + [UInt8(total), UInt8(index)]) + slice
     }
 }
 
